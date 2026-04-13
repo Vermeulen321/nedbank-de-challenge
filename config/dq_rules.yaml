@@ -1,0 +1,44 @@
+# Data Quality Rules
+# Read by transform.py to apply DQ flagging to transactions.
+# Keeping logic here (not hardcoded in Python) allows Stage 2/3
+# to tighten or relax rules without touching pipeline code.
+
+# Fields that must not be null.
+# Violation → dq_flag = "NULL_REQUIRED"
+null_checks:
+  transactions:
+    - transaction_id
+    - account_id
+    - transaction_date
+    - transaction_type
+    - amount
+
+# Enumerated value domains per field.
+# Out-of-domain value → dq_flag as specified.
+domain_checks:
+  transaction_type:
+    allowed: [DEBIT, CREDIT, FEE, REVERSAL]
+    dq_flag: TYPE_MISMATCH
+  channel:
+    allowed: [POS, APP, ATM, EFT, USSD, INTERNAL]
+    dq_flag: TYPE_MISMATCH
+
+# Currency normalisation.
+# Non-ZAR source values → dq_flag = "CURRENCY_VARIANT", then normalised to ZAR.
+currency_normalisation:
+  target_value: ZAR
+  flag_variants: true
+
+# Date fields that must parse as ISO YYYY-MM-DD.
+# Unparseable value → dq_flag = "DATE_FORMAT"
+date_format_checks:
+  - transaction_date
+
+# Referential integrity.
+# Transaction referencing an account_id absent from silver accounts
+# → dq_flag = "ORPHANED_ACCOUNT"
+referential_integrity:
+  transactions:
+    - field: account_id
+      references: accounts
+      dq_flag: ORPHANED_ACCOUNT
