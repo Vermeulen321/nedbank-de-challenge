@@ -130,10 +130,40 @@ files there when you reach Stage 3. The `.jsonl` data files are excluded via `.g
 | Stage 2 | `stage2-submission` | End of Day 14 |
 | Stage 3 | `stage3-submission` | End of Day 21 |
 
+The same repository carries all three stages — each tag points at the
+commit that represents that stage's submission state. Tag names must
+match exactly; `stage1`, `Stage1-submission`, etc. will not be found.
+
 ```bash
-git tag -a stage1-submission -m "Stage 1 submission"
-git push origin stage1-submission
+git tag -a stage2-submission -m "Stage 2 submission"
+git push origin stage2-submission
 ```
+
+---
+
+## Stage 2 Notes
+
+Stage 2 triples the data volume, injects six categories of DQ issues,
+and adds a `merchant_subcategory` field. The pipeline handles all of
+this without structural rewrites — Stage 2 amounts to:
+
+- Switching the transaction reader to `text` + `from_json` with an
+  explicit STRING-typed schema (so currency variants like `710` and
+  string-quoted amounts both parse cleanly), plus a regex on the raw
+  line to capture `_amount_was_string` for TYPE_MISMATCH detection.
+- Adding `amount_type_mismatch` to the dq_report issue list.
+- Building `transaction_timestamp` from the *normalised* date so DMY
+  and Unix-epoch source dates produce a valid TIMESTAMP.
+
+DQ rules — including which `dq_flag` is set, which records are
+quarantined, and which are cast/normalised in place — are declared
+entirely in `config/dq_rules.yaml`. No pipeline code needs to change
+to swap `QUARANTINED` for `NORMALISED` on a given issue type; only
+the handling action string in the YAML.
+
+Stage 2 output adds `/data/output/dq_report.json` to the existing
+Stage 1 Gold-layer output. All three Stage 1 validation queries
+continue to pass on Stage 2 data with DQ handling applied.
 
 ---
 
@@ -161,3 +191,12 @@ git push origin stage1-submission
 | Writable paths | `/data/output/` and `/tmp` (512 MB) only |
 
 See `resource_constraints.md` for practical guidance on working within these limits.
+
+---
+
+## Development Notes
+
+This pipeline was developed with the assistance of [Claude](https://claude.ai) (Anthropic),
+an AI coding assistant. Claude was used to help design the medallion architecture,
+write and review pipeline code, debug Spark/Delta Lake configuration issues, and
+implement the Stage 2 data quality handling and reporting logic.

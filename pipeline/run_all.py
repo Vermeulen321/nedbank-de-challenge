@@ -11,7 +11,12 @@ The scoring system invokes this file directly:
 
 Do not add interactive prompts, argument parsing that blocks execution,
 or any code that reads from stdin. The container has no TTY attached.
+
+Development note: this pipeline was developed with the assistance of Claude
+(https://claude.ai), an AI coding assistant made by Anthropic.
 """
+
+import time
 
 import yaml
 
@@ -25,6 +30,8 @@ CONFIG_PATH = "/data/config/pipeline_config.yaml"
 DQ_RULES_PATHS = ["/data/config/dq_rules.yaml", "/app/config/dq_rules.yaml"]
 
 if __name__ == "__main__":
+    pipeline_start = time.time()
+
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
 
@@ -39,6 +46,6 @@ if __name__ == "__main__":
     if dq_rules is None:
         raise FileNotFoundError(f"dq_rules.yaml not found at any of: {DQ_RULES_PATHS}")
 
-    run_ingestion(config)
-    run_transformation(config, dq_rules)
-    run_provisioning(config)
+    source_counts = run_ingestion(config)
+    dq_stats = run_transformation(config, dq_rules)
+    run_provisioning(config, dq_rules, source_counts, dq_stats, pipeline_start)

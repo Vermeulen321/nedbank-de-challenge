@@ -29,12 +29,21 @@ See output_schema_spec.md for the complete field-by-field specification.
 """
 
 
+import json
+from datetime import datetime, timezone
+
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import (
     col, conv, current_date, datediff, floor, lit, substring, sha2, when,
 )
 
 from pipeline.spark_utils import get_or_create_spark
+
+# dq_flag values whose records are excluded from fact_transactions.
+# - ORPHANED_ACCOUNT:  no valid account; quarantined.
+# - DUPLICATE_DEDUPED: extra copy; only the first occurrence (dq_flag=NULL) is kept.
+# - NULL_REQUIRED:     required field missing; cannot be reliably loaded.
+_EXCLUDED_FLAGS = {"ORPHANED_ACCOUNT", "DUPLICATE_DEDUPED", "NULL_REQUIRED"}
 
 
 def _add_sk(df: DataFrame, natural_key_col: str, sk_col_name: str) -> DataFrame:
@@ -69,7 +78,113 @@ def _age_band_expr(dob_col: str):
     )
 
 
-def run_provisioning(config: dict) -> None:
+def _write_dq_report(
+    config: dict,
+    dq_rules: dict,
+    source_counts: dict,
+    dq_stats: dict,
+    gold_counts: dict,
+    pipeline_start: float,
+) -> None:
+    """Write /data/output/dq_report.json conforming to dq_report_template.json."""
+    import time
+
+    run_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    duration = int(time.time() - pipeline_start)
+
+    handling_actions = dq_rules.get("handling_actions", {})
+    txn_raw = source_counts["transactions_raw"]
+    acct_raw = source_counts["accounts_raw"]
+
+    # Total non-standard dates across all source files.
+    total_date_issues = (
+        dq_stats.get("date_issues_accounts", 0)
+        + dq_stats.get("date_issues_customers", 0)
+        + dq_stats.get("date_format_transactions", 0)
+    )
+
+    # Build dq_issues list — omit zero-count entries per spec.
+    issue_specs = [
+        {
+            "issue_type": "duplicate_transactions",
+            "records_affected": dq_stats.get("duplicate_transactions", 0),
+            "denominator": txn_raw,
+            "handling_action": handling_actions.get("duplicate_transactions", "DEDUPLICATED_KEEP_FIRST"),
+            "records_in_output": 0,
+        },
+        {
+            "issue_type": "orphaned_transactions",
+            "records_affected": dq_stats.get("orphaned_transactions", 0),
+            "denominator": txn_raw,
+            "handling_action": handling_actions.get("orphaned_transactions", "QUARANTINED"),
+            "records_in_output": 0,
+        },
+        {
+            "issue_type": "amount_type_mismatch",
+            "records_affected": dq_stats.get("amount_type_mismatch", 0),
+            "denominator": txn_raw,
+            "handling_action": handling_actions.get("amount_type_mismatch", "CAST_TO_DECIMAL"),
+            "records_in_output": dq_stats.get("amount_type_mismatch", 0),
+        },
+        {
+            "issue_type": "date_format_inconsistency",
+            "records_affected": total_date_issues,
+            "denominator": txn_raw,
+            "handling_action": handling_actions.get("date_format_inconsistency", "NORMALISED_DATE"),
+            "records_in_output": total_date_issues,
+        },
+        {
+            "issue_type": "currency_variants",
+            "records_affected": dq_stats.get("currency_variants", 0),
+            "denominator": txn_raw,
+            "handling_action": handling_actions.get("currency_variants", "NORMALISED_CURRENCY"),
+            "records_in_output": dq_stats.get("currency_variants", 0),
+        },
+        {
+            "issue_type": "null_account_id",
+            "records_affected": dq_stats.get("null_account_id", 0),
+            "denominator": acct_raw,
+            "handling_action": handling_actions.get("null_account_id", "EXCLUDED_NULL_PK"),
+            "records_in_output": 0,
+        },
+    ]
+
+    dq_issues = [
+        {
+            "issue_type": spec["issue_type"],
+            "records_affected": spec["records_affected"],
+            "percentage_of_total": round(
+                spec["records_affected"] / spec["denominator"] * 100, 2
+            ) if spec["denominator"] > 0 else 0.0,
+            "handling_action": spec["handling_action"],
+            "records_in_output": spec["records_in_output"],
+        }
+        for spec in issue_specs
+        if spec["records_affected"] > 0
+    ]
+
+    report = {
+        "$schema": "nedbank-de-challenge/dq-report/v1",
+        "run_timestamp": run_timestamp,
+        "stage": "2",
+        "source_record_counts": source_counts,
+        "dq_issues": dq_issues,
+        "gold_layer_record_counts": gold_counts,
+        "execution_duration_seconds": duration,
+    }
+
+    report_path = config["output"].get("dq_report_path", "/data/output/dq_report.json")
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+
+def run_provisioning(
+    config: dict,
+    dq_rules: dict = None,
+    source_counts: dict = None,
+    dq_stats: dict = None,
+    pipeline_start: float = None,
+) -> None:
     spark = get_or_create_spark(config)
     silver = config["output"]["silver_path"]
     gold = config["output"]["gold_path"]
@@ -119,6 +234,12 @@ def run_provisioning(config: dict) -> None:
     # ── fact_transactions ─────────────────────────────────────────────────────
     txns = spark.read.format("delta").load(silver + "/transactions")
 
+    # Exclude records that are quarantined or deduped-away — they must not appear
+    # in fact_transactions (confirmed by Validation Query 2 and dq_report counts).
+    txns = txns.filter(
+        col("dq_flag").isNull() | ~col("dq_flag").isin(list(_EXCLUDED_FLAGS))
+    )
+
     # Lookup tables: only the columns needed to resolve surrogate keys.
     acct_lookup = dim_accounts.select("account_id", "account_sk", "customer_id")
     cust_lookup = dim_customers.select("customer_id", "customer_sk")
@@ -131,10 +252,8 @@ def run_provisioning(config: dict) -> None:
     # Surrogate key for transactions.
     fact = _add_sk(fact, "transaction_id", "transaction_sk")
 
-    # merchant_subcategory is absent from Stage 1 source; include as NULL
-    # so the schema matches the spec and scoring queries don't fail.
-    fact = fact.withColumn("merchant_subcategory", lit(None).cast("string"))
-
+    # merchant_subcategory is included from silver (Stage 2 populates it;
+    # Stage 1 silver has it as NULL due to the absent source field).
     fact = fact.select(
         "transaction_sk",
         "transaction_id",
@@ -153,3 +272,14 @@ def run_provisioning(config: dict) -> None:
         "ingestion_timestamp",
     )
     fact.write.format("delta").mode("overwrite").save(gold + "/fact_transactions")
+
+    # ── Write dq_report.json (Stage 2+) ───────────────────────────────────────
+    if source_counts is not None and dq_stats is not None:
+        gold_counts = {
+            "fact_transactions": spark.read.format("delta").load(gold + "/fact_transactions").count(),
+            "dim_accounts": spark.read.format("delta").load(gold + "/dim_accounts").count(),
+            "dim_customers": spark.read.format("delta").load(gold + "/dim_customers").count(),
+        }
+        _write_dq_report(
+            config, dq_rules or {}, source_counts, dq_stats, gold_counts, pipeline_start or 0.0
+        )
