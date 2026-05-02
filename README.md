@@ -167,6 +167,34 @@ continue to pass on Stage 2 data with DQ handling applied.
 
 ---
 
+## Stage 3 Notes
+
+Stage 3 adds a streaming path on top of the Stage 2 batch pipeline.
+The batch pipeline runs first to completion and writes the same
+Stage 2 outputs; the streaming pass then polls `/data/stream/` for
+micro-batch JSONL files and maintains two new Gold tables under
+`/data/output/stream_gold/`:
+
+- `current_balances` — one row per `account_id`, balance walked
+  forward from the batch `dim_accounts.current_balance` baseline by
+  applying CREDIT/REVERSAL as additions and DEBIT/FEE as subtractions.
+- `recent_transactions` — last 50 events per `account_id`, merged on
+  `(account_id, transaction_id)` and pruned per cycle.
+
+The streaming pass is wired into the existing entry point: when a
+`streaming:` block is present in `pipeline_config.yaml` (and the
+`/data/stream/` directory exists), `run_all.py` calls
+`run_stream_ingestion` after the batch pass; otherwise it skips it.
+The polling loop exits once no new files have appeared for
+`quiesce_timeout_seconds` (default 60s), well before the 30-minute
+container timeout.
+
+The schema and date-parsing helpers used by streaming are imported
+directly from `ingest.py` and `transform.py` — no duplication. See
+[`adr/stage3_adr.md`](adr/stage3_adr.md) for the full design rationale.
+
+---
+
 ## Key References
 
 | Document | What it covers |

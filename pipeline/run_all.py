@@ -23,6 +23,7 @@ import yaml
 from pipeline.ingest import run_ingestion
 from pipeline.transform import run_transformation
 from pipeline.provision import run_provisioning
+from pipeline.stream_ingest import run_stream_ingestion
 
 CONFIG_PATH = "/data/config/pipeline_config.yaml"
 # dq_rules.yaml: prefer the scorer-mounted version; fall back to the copy
@@ -49,3 +50,9 @@ if __name__ == "__main__":
     source_counts = run_ingestion(config)
     dq_stats = run_transformation(config, dq_rules)
     run_provisioning(config, dq_rules, source_counts, dq_stats, pipeline_start)
+
+    # Stage 3: streaming pass. Runs only when a `streaming:` block is
+    # present in pipeline_config.yaml AND /data/stream/ exists. The same
+    # entry point therefore works unchanged at Stage 1 and Stage 2.
+    if config.get("streaming"):
+        run_stream_ingestion(config)

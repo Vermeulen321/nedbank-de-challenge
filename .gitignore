@@ -32,4 +32,3 @@ stream/*.jsonl
 
 # Test artefacts
 .pytest_cache/
-adr/
